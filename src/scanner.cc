@@ -70,21 +70,25 @@ static const char *str(int32_t chr) {
 
 struct Scanner {
   unsigned serialize(char *buffer) {
-    if (delimiter.length() + 1 >= TREE_SITTER_SERIALIZATION_BUFFER_SIZE) return 0;
+    if (delimiter.length() + 2 >= TREE_SITTER_SERIALIZATION_BUFFER_SIZE) return 0;
     buffer[0] = is_nowdoc;
     buffer[1] = did_start;
-    delimiter.copy(&buffer[2], delimiter.length());
-    return delimiter.length() + 2;
+    buffer[2] = did_body;
+    delimiter.copy(&buffer[3], delimiter.length());
+    return delimiter.length() + 3;
   }
 
   void deserialize(const char *buffer, unsigned length) {
     if (length == 0) {
       is_nowdoc = false;
+      did_start = false;
+      did_body = false;
       delimiter.clear();
     } else {
       is_nowdoc = buffer[0];
       did_start = buffer[1];
-      delimiter.assign(&buffer[2], &buffer[length]);
+      did_body = buffer[2];
+      delimiter.assign(&buffer[3], &buffer[length]);
     }
   }
 
@@ -97,17 +101,26 @@ struct Scanner {
 
     print("peek %s\n", str(peek()));
 
-    if ((expected[HEREDOC_BODY] || expected[HEREDOC_END]) && !delimiter.empty()) {
+    if ((expected[HEREDOC_BODY] || expected[HEREDOC_END])) {
+      if (delimiter.empty()) return false;
+
       if (!did_start) {
-        //<<<HEREDOC   \n
-        //          ^^^ consume this whitespace
-        while (iswspace(peek()) && peek() != '\n') skip();
+        if (peek() == '\n') {
+          did_start = true;
+          skip();
+        } else {
+          return false;
+        }
       }
 
-      if (expected[HEREDOC_END] && scan_end(lexer)) {
+      if (did_body && peek() == '\n') {
+        skip();
+      }
+
+      if (expected[HEREDOC_END] && scan_end(lexer, true)) {
         delimiter.clear();
-        did_start = false;
         is_nowdoc = false;
+        did_body = false;
 
         set(HEREDOC_END);
         return true;
@@ -117,11 +130,11 @@ struct Scanner {
         set(HEREDOC_BODY);
         return true;
       }
-    }
 
-    if (expected[HEREDOC_START]) {
+      // If HEREDOC_BODY or HEREDOC_END is expected, then HEREDOC_START is
+      // not valid even if expected.
+    } else if (expected[HEREDOC_START]) {
       if (scan_start(lexer)) {
-        did_start = false;
         set(HEREDOC_START);
         return true;
       }
@@ -135,14 +148,17 @@ struct Scanner {
 
     while (iswspace(peek())) skip();
 
-    is_nowdoc = peek() == '\'';
-    delimiter.clear();
-
     int32_t quote = 0;
-    if (is_nowdoc || peek() == '"') {
+
+    if (peek() == '\'' || peek() == '"') {
       quote = peek();
+      is_nowdoc = true;
       next();
+    } else {
+      is_nowdoc = false;
     }
+
+    delimiter.clear();
 
     if (iswalpha(peek()) || peek() == '_') {
       delimiter += peek();
@@ -156,62 +172,60 @@ struct Scanner {
 
     print("del %s\n", delimiter.c_str());
 
-    if (peek() == quote) {
-      next();
-    } else if (quote != 0) {
-      // Opening quote exists, but we found no matching closing quote.
-      return false;
+    if (is_nowdoc) {
+      if (peek() == quote) {
+        next();
+      } else {
+        return false;
+      }
+    }
+
+    if (peek() != '\n') {
+      delimiter.clear();
     }
 
     return !delimiter.empty();
   }
 
-  bool scan_end(TSLexer *lexer) {
+  /**
+   * Scan for matching heredoc end. If mark_end is true, then we're trying to match the heredoc
+   * end token. Otherwise, we're only looking ahead to know if we found the heredoc body end.
+   */
+  bool scan_end(TSLexer *lexer, bool mark_end) {
     print("scan end\n");
 
-    prefix.clear();
-
-    if (peek() == '\n') {
-      skip();
+    if (mark_end && peek() == '\n') {
       did_start = true;
-    } else {
-      return false;
+      // If mark_end is true, stop() should not have been called so it's safe to skip().
+      skip();
     }
 
-    while (
-        // Let `prefix` grow one character beyond `delimiter`.
-        prefix.length() <= delimiter.length() &&
+    for (int i = 0; i < delimiter.length(); ++i) {
+      if (delimiter[i] == peek()) {
+        next();
+      } else {
+        print("scan end ->\n");
+        return false;
+      }
+    }
 
-        // clang-format off
-        peek() != ';' &&
-        peek() != '\n' &&
-        peek() != ',' &&
-        peek() != '$'
-        // clang-format on
-    ) {
-      prefix += peek();
+    if (mark_end) {
+      stop();
+    }
+
+    // In all cases, stop() should have already been called, so ; is never included in the token.
+    if (peek() == ';') {
       next();
     }
 
-    print("pre %s ?= %s\n", prefix.c_str(), delimiter.c_str());
-
-    return prefix == delimiter;
+    print("scan end ->\n");
+    return peek() == '\n';
   }
 
   bool scan_body(TSLexer *lexer) {
     print("scan body\n");
 
-    if (!did_start) {
-      if (peek() == '\n') {
-        skip();
-      } else {
-        return false;
-      }
-
-      did_start = true;
-    }
-
-    if (!is_nowdoc && prefix.empty()) {
+    if (!is_nowdoc) {
       if (peek() == '{') next();
       if (peek() == '$') {
         next();
@@ -263,12 +277,24 @@ struct Scanner {
         }
 
         case '\n': {
-          stop();
+          if (did_start) {
+            stop();
+            next();
 
-          if (scan_end(lexer)) {
-            return true;
+            if (scan_end(lexer, false)) {
+              did_body = true;
+              return true;
+            }
+          } else {
+            skip();
+            stop();
+            did_start = true;
+
+            if (scan_end(lexer, false)) {
+              did_body = true;
+              return false;
+            }
           }
-
           break;
         }
 
@@ -286,8 +312,8 @@ struct Scanner {
   }
 
   string delimiter;
-  string prefix;
   bool is_nowdoc;
+  bool did_body;
   bool did_start;
 };
 
